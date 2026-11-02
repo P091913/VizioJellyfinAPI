@@ -1,0 +1,9 @@
+services:
+  tvremote:
+    build: .                  # build the image from the Dockerfile in this folder
+    image: tvremote           # name of the built image
+    container_name: tvremote  # name of the running container (docker logs tvremote)
+    restart: unless-stopped   # start again after a crash or reboot, unless you stopped it yourself
+    ports:
+      - "5055:8080"           # your PC's port 5055 -> port 8080 inside the container
+    env_file: .env            # settings and secrets; see .env.example
