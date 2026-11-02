@@ -80,6 +80,23 @@ public sealed class JellyfinClient(HttpClient http)
         return res?.Items?.FirstOrDefault();
     }
 
+    /// <summary>One playable item by id, no user needed - the same /Items query search uses.</summary>
+    public async Task<JfItem?> GetByIdAsync(string itemId, CancellationToken ct)
+    {
+        var res = await http.GetFromJsonAsync<JfQueryResult>(
+            $"/Items?ids={Uri.EscapeDataString(itemId)}&includeItemTypes=Movie,Series,Episode&recursive=true&fields=ProductionYear", Json, ct);
+        // Jellyfin ignores an id it can't parse and returns other items, so only an exact id match counts.
+        return res?.Items?.FirstOrDefault(i => string.Equals(i.Id, itemId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>An episode by season and number; without a number, the season's first episode.</summary>
+    public async Task<JfItem?> GetEpisodeAsync(string seriesId, int season, int? episode, CancellationToken ct)
+    {
+        var res = await http.GetFromJsonAsync<JfQueryResult>($"/Shows/{seriesId}/Episodes?season={season}", Json, ct);
+        var items = res?.Items ?? [];
+        return episode is int n ? items.FirstOrDefault(i => i.IndexNumber == n) : items.FirstOrDefault();
+    }
+
     public async Task PlayAsync(string sessionId, string itemId, long? startTicks, CancellationToken ct)
     {
         var url = $"/Sessions/{sessionId}/Playing?playCommand=PlayNow&itemIds={itemId}";

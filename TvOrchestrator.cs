@@ -9,6 +9,27 @@ public sealed class TvException(string message) : Exception(message);
 /// <param name="Message">A sentence a voice assistant can read out as-is.</param>
 public sealed record CommandResult(string Status, string Message, object? Data = null);
 
+/// <summary>Structured play options from POST /tv/play. All optional; None plays like before.</summary>
+public sealed record PlayFilter(string? ItemId = null, string? Kind = null, int? Season = null, int? Episode = null)
+{
+    public static readonly PlayFilter None = new();
+
+    public string? Problem() =>
+        Kind is not (null or "movie" or "series") ? "kind must be \"movie\" or \"series\"."
+        : Episode is not null && Season is null ? "Say which season too."
+        : Season is < 0 || Episode is < 1 ? "Season and episode numbers must be positive."
+        : Season is not null && Kind == "movie" ? "Movies don't have seasons."
+        : null;
+
+    /// <summary>A season or episode implies a series.</summary>
+    public bool Accepts(JfItem item) => (Kind ?? (Season is null ? null : "series")) switch
+    {
+        "movie" => item.Type == "Movie",
+        "series" => item.Type == "Series",
+        _ => true,
+    };
+}
+
 /// <summary>Wakes the TV, opens Jellyfin, finds the TV's session, and plays things on it.</summary>
 public sealed class TvOrchestrator(
     VizioClient tv,
@@ -40,41 +61,72 @@ public sealed class TvOrchestrator(
         };
     }
 
-    public async Task<CommandResult> PlayAsync(ParsedCommand cmd, bool dryRun, CancellationToken ct)
+    public async Task<CommandResult> PlayAsync(ParsedCommand cmd, bool dryRun, CancellationToken ct, PlayFilter? filter = null)
     {
+        filter ??= PlayFilter.None;
+        if (filter.Problem() is { } problem)
+            return new CommandResult("unknown_command", problem);
+
         return await Guard(async () =>
         {
-            if (cmd.Intent != Intent.Play || string.IsNullOrWhiteSpace(cmd.Title))
-                return new CommandResult("unknown_command", "Tell me what to play.");
-
-            // 1. Search (before waking the TV, so a typo doesn't turn it on)
-            var results = new List<JfItem>();
-            foreach (var term in TitleMatcher.SearchVariants(cmd))
+            JfItem item;
+            if (filter.ItemId is { } itemId)
             {
-                results.AddRange(await jf.SearchAsync(term, ct));
-                if (results.Any(r => TitleMatcher.Score(cmd, r) >= 98)) break;
+                // A choice the caller already made from our candidates: no search, no scoring.
+                JfItem? chosen;
+                try { chosen = await jf.GetByIdAsync(itemId, ct); }
+                catch (HttpRequestException ex) when (ex.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.BadRequest) { chosen = null; }
+                if (chosen is null)
+                    return new CommandResult("not_found", "That's no longer in your library.", new { candidates = Array.Empty<object>() });
+                item = chosen;
+            }
+            else
+            {
+                if (cmd.Intent != Intent.Play || string.IsNullOrWhiteSpace(cmd.Title))
+                    return new CommandResult("unknown_command", "Tell me what to play.");
+
+                // 1. Search (before waking the TV, so a typo doesn't turn it on). Filter inside the loop, so a
+                //    perfect movie match doesn't stop the search when the caller asked for the series.
+                var results = new List<JfItem>();
+                foreach (var term in TitleMatcher.SearchVariants(cmd))
+                {
+                    results.AddRange((await jf.SearchAsync(term, ct)).Where(filter.Accepts));
+                    if (results.Any(r => TitleMatcher.Score(cmd, r) >= 98)) break;
+                }
+
+                // Last resort: a short prefix catches "spiderman" -> "Spider-Man"; the scorer filters the noise.
+                if (results.Count == 0 && TitleMatcher.PrefixVariant(cmd) is { } prefix)
+                    results.AddRange((await jf.SearchAsync(prefix, ct)).Where(filter.Accepts));
+
+                var match = TitleMatcher.Pick(cmd, results);
+                var candidates = match.Candidates.Select(c => new { c.Id, c.Name, c.Type, c.ProductionYear, c.Label }).ToList();
+
+                if (match.Kind == MatchKind.NotFound)
+                {
+                    var msg = candidates.Count == 0
+                        ? $"I couldn't find \"{cmd.Title}\" in your library."
+                        : $"I couldn't find \"{cmd.Title}\". Did you mean {JoinOr(match.Candidates.Select(c => c.Label))}?";
+                    return new CommandResult("not_found", msg, new { candidates });
+                }
+
+                if (match.Kind == MatchKind.Ambiguous)
+                    return new CommandResult("ambiguous",
+                        $"Which one: {JoinOr(match.Candidates.Select(c => c.Label))}?", new { candidates });
+
+                item = match.Item!;
             }
 
-            // Last resort: a short prefix catches "spiderman" -> "Spider-Man"; the scorer filters the noise.
-            if (results.Count == 0 && TitleMatcher.PrefixVariant(cmd) is { } prefix)
-                results.AddRange(await jf.SearchAsync(prefix, ct));
-
-            var match = TitleMatcher.Pick(cmd, results);
-            var candidates = match.Candidates.Select(c => new { c.Id, c.Name, c.Type, c.ProductionYear, c.Label }).ToList();
-
-            if (match.Kind == MatchKind.NotFound)
+            // A specific season/episode resolves before waking the TV too, so a wrong number doesn't turn it on.
+            if (item.Type == "Series" && filter.Season is int season)
             {
-                var msg = candidates.Count == 0
-                    ? $"I couldn't find \"{cmd.Title}\" in your library."
-                    : $"I couldn't find \"{cmd.Title}\". Did you mean {JoinOr(match.Candidates.Select(c => c.Label))}?";
-                return new CommandResult("not_found", msg, new { candidates });
+                var episode = await jf.GetEpisodeAsync(item.Id, season, filter.Episode, ct);
+                if (episode is null)
+                    return new CommandResult("not_found",
+                        filter.Episode is int e ? $"{item.Name} has no season {season}, episode {e}." : $"{item.Name} has no season {season}.",
+                        new { candidates = Array.Empty<object>() });
+                item = episode; // from here on it plays like any episode, with resume
             }
 
-            if (match.Kind == MatchKind.Ambiguous)
-                return new CommandResult("ambiguous",
-                    $"Which one: {JoinOr(match.Candidates.Select(c => c.Label))}?", new { candidates });
-
-            var item = match.Item!;
             if (dryRun)
                 return new CommandResult("would_play", $"Would play {item.Label}.", new { item });
 
