@@ -74,7 +74,8 @@ app.MapPost("/tv/command", async (CommandRequest req, TvOrchestrator tv) =>
     ToHttp(await tv.HandleTextAsync(req.Text, req.DryRun, stopping)));
 
 app.MapPost("/tv/play", async (PlayRequest req, TvOrchestrator tv) =>
-    ToHttp(await tv.PlayAsync(CommandParser.ForTitle(req.Title ?? ""), req.DryRun, stopping)));
+    ToHttp(await tv.PlayAsync(CommandParser.ForTitle(req.Title ?? ""), req.DryRun, stopping,
+        new PlayFilter(req.ItemId, req.Kind, req.Season, req.Episode))));
 
 app.MapPost("/tv/launch", async (TvOrchestrator tv) => ToHttp(await tv.LaunchAsync(stopping)));
 app.MapPost("/tv/off", async (TvOrchestrator tv) => ToHttp(await tv.PowerOffAsync(stopping)));
@@ -93,4 +94,7 @@ static IResult ToHttp(CommandResult r) => r.Status switch
 };
 
 public sealed record CommandRequest(string? Text, bool DryRun = false);
-public sealed record PlayRequest(string? Title, bool DryRun = false);
+/// <param name="ItemId">Play exactly this candidate from an earlier ambiguous/not_found answer; Title is then ignored.</param>
+/// <param name="Kind">"movie" or "series": only consider that type.</param>
+/// <param name="Season">On a series, play this season (its first episode, or <paramref name="Episode"/>) instead of next-up.</param>
+public sealed record PlayRequest(string? Title, bool DryRun = false, string? ItemId = null, string? Kind = null, int? Season = null, int? Episode = null);
